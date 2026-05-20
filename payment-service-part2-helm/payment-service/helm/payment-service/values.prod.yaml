@@ -1,0 +1,30 @@
+# values.prod.yaml
+# Override file for production environment.
+# Usage: helm upgrade payment-service ./helm/payment-service \
+#          -f values.yaml -f values.prod.yaml \
+#          --set image.tag=$GIT_COMMIT_SHA
+
+replicaCount: 5
+
+autoscaling:
+  minReplicas: 5
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60   # Scale earlier under prod load
+
+podDisruptionBudget:
+  minAvailable: 3                       # Stricter in prod — keep more pods up
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "1000m"
+    memory: "512Mi"
+
+ingress:
+  host: payment.moniepoint.com          # Public domain in prod
+
+env:
+  APP_ENV: "production"
+  LOG_LEVEL: "warning"                  # Less verbose in prod

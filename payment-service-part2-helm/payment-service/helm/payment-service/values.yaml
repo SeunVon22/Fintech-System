@@ -1,0 +1,119 @@
+# ── values.yaml ───────────────────────────────────────────────────────────────
+# Default values for payment-service.
+# Override per environment: helm upgrade ... -f values.prod.yaml
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: ""          # Set by Jenkins: <acr-name>.azurecr.io/payment-service
+  tag: "latest"           # Overridden by Jenkins with the git commit SHA
+  pullPolicy: Always
+
+# ── Replicas & autoscaling ────────────────────────────────────────────────────
+replicaCount: 3           # Never run <2 in production — PDB enforces this
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# ── PodDisruptionBudget ───────────────────────────────────────────────────────
+# Guarantees at least 2 pods stay running during node drain / rolling upgrades
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP           # Ingress sits in front — no need for LoadBalancer
+  port: 80
+  targetPort: 8000
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  host: payment.moniepoint.internal
+  tls: true
+  tlsSecretName: payment-tls-secret
+  annotations:
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+# Always set both requests AND limits.
+# Requests → used by scheduler to place pods.
+# Limits   → enforced at runtime (CPU throttle / OOMKill).
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+livenessProbe:
+  path: /healthz
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  path: /readyz
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+# ── Security context ──────────────────────────────────────────────────────────
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# ── Environment variables ─────────────────────────────────────────────────────
+env:
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+
+# ── Secret references (values come from Kubernetes Secrets) ───────────────────
+# In production these are populated by Vault Agent sidecar injector
+secretEnv:
+  DB_PASSWORD:
+    secretName: payment-db-secret
+    secretKey: password
+  API_KEY:
+    secretName: payment-api-secret
+    secretKey: api-key
+
+# ── Prometheus scraping ───────────────────────────────────────────────────────
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  path: /metrics
+
+# ── Pod anti-affinity ─────────────────────────────────────────────────────────
+# Spreads pods across nodes so a single node failure doesn't take all replicas
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - payment-service
+          topologyKey: kubernetes.io/hostname
+
+# ── Node selector & tolerations ───────────────────────────────────────────────
+nodeSelector: {}
+tolerations: []

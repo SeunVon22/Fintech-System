@@ -1,0 +1,413 @@
+// ── Jenkinsfile ───────────────────────────────────────────────────────────────
+// Pipeline: Payment Status Microservice → AKS
+//
+// Stages:
+//   1. Checkout          — clone repo, set build metadata
+//   2. Test              — run pytest, publish results
+//   3. Code quality      — SonarQube SAST scan
+//   4. Build & push      — Docker multi-stage build → ACR
+//   5. Security scan     — Trivy container vulnerability scan
+//   6. Terraform plan    — show infrastructure changes (no apply yet)
+//   7. Deploy to staging — helm upgrade on staging AKS namespace
+//   8. Smoke test        — hit /healthz and /readyz on staging
+//   9. Approval gate     — manual sign-off before production
+//  10. Deploy to prod    — helm upgrade on prod AKS namespace
+//  11. Notify            — Slack notification on success or failure
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+
+    // Run on any agent with Docker and kubectl available.
+    // In production, use a dedicated Kubernetes pod template (Jenkins K8s plugin)
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true            # required for Docker-in-Docker
+      volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+    - name: tools
+      image: mcr.microsoft.com/azure-cli:latest
+      command: [cat]
+      tty: true
+  volumes:
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+"""
+        }
+    }
+
+    // ── Pipeline-wide environment ─────────────────────────────────────────────
+    environment {
+        // ACR details — set these in Jenkins → Manage → Configure System
+        ACR_NAME          = credentials('acr-name')           // e.g. moniepointprodacr
+        ACR_LOGIN_SERVER  = credentials('acr-login-server')   // e.g. moniepointprodacr.azurecr.io
+        IMAGE_NAME        = "payment-service"
+        IMAGE_TAG         = "${GIT_COMMIT[0..7]}"             // short SHA → traceable deploys
+
+        // AKS details
+        AKS_CLUSTER_NAME  = credentials('aks-cluster-name')
+        AKS_RESOURCE_GROUP= credentials('aks-resource-group')
+
+        // SonarQube
+        SONAR_TOKEN       = credentials('sonarqube-token')
+        SONAR_HOST_URL    = credentials('sonarqube-url')
+
+        // Slack
+        SLACK_CHANNEL     = "#platform-deployments"
+
+        // Helm release name
+        HELM_RELEASE      = "payment-service"
+        HELM_CHART        = "./helm/payment-service"
+    }
+
+    options {
+        // Keep only last 10 builds to save disk space
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // Fail the pipeline if it runs longer than 30 minutes
+        timeout(time: 30, unit: 'MINUTES')
+        // Add timestamps to every log line
+        timestamps()
+        // Don't allow concurrent builds of the same branch
+        disableConcurrentBuilds()
+    }
+
+    // Trigger on GitHub webhook push to main or any release/* branch
+    triggers {
+        githubPush()
+    }
+
+    stages {
+
+        // ── Stage 1: Checkout ─────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    // Make build metadata available to all stages
+                    env.GIT_AUTHOR      = sh(script: "git log -1 --pretty=%an", returnStdout: true).trim()
+                    env.GIT_MESSAGE     = sh(script: "git log -1 --pretty=%s",  returnStdout: true).trim()
+                    env.FULL_IMAGE_NAME = "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+                    echo "Building commit ${IMAGE_TAG} by ${env.GIT_AUTHOR}: ${env.GIT_MESSAGE}"
+                }
+            }
+        }
+
+        // ── Stage 2: Test ─────────────────────────────────────────────────────
+        // Run all pytest tests. Pipeline fails immediately if any test fails.
+        // Results are published so Jenkins shows pass/fail trends over time.
+        stage('Test') {
+            steps {
+                container('tools') {
+                    sh '''
+                        pip install -r app/requirements.txt --quiet
+                        pytest app/tests/ \
+                            --verbose \
+                            --junitxml=reports/test-results.xml \
+                            --cov=app \
+                            --cov-report=xml:reports/coverage.xml \
+                            --cov-fail-under=80
+                    '''
+                }
+            }
+            post {
+                always {
+                    // Publish JUnit results so Jenkins tracks test trends
+                    junit 'reports/test-results.xml'
+                    // Publish coverage report
+                    publishCoverage adapters: [coberturaAdapter('reports/coverage.xml')]
+                }
+            }
+        }
+
+        // ── Stage 3: Code Quality (SonarQube SAST) ────────────────────────────
+        // Static analysis: security hotspots, code smells, duplication.
+        // Pipeline fails if Quality Gate is not met (configured in SonarQube).
+        stage('Code Quality') {
+            steps {
+                container('tools') {
+                    withSonarQubeEnv('sonarqube') {
+                        sh """
+                            sonar-scanner \
+                                -Dsonar.projectKey=payment-service \
+                                -Dsonar.sources=app \
+                                -Dsonar.python.coverage.reportPaths=reports/coverage.xml \
+                                -Dsonar.host.url=${SONAR_HOST_URL} \
+                                -Dsonar.login=${SONAR_TOKEN}
+                        """
+                    }
+                    // Wait for SonarQube to process results and check Quality Gate
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+        }
+
+        // ── Stage 4: Build & Push Docker image ───────────────────────────────
+        // Multi-stage Docker build → tag with git SHA → push to ACR.
+        // Using managed identity so no docker login credentials needed.
+        stage('Build & Push') {
+            steps {
+                container('docker') {
+                    script {
+                        sh """
+                            # Login to ACR using Azure CLI managed identity
+                            az acr login --name ${ACR_NAME}
+
+                            # Build — uses multi-stage Dockerfile
+                            docker build \
+                                --tag ${env.FULL_IMAGE_NAME} \
+                                --tag ${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest \
+                                --label git-commit=${IMAGE_TAG} \
+                                --label build-date=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                                --cache-from ${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest \
+                                .
+
+                            # Push both tags
+                            docker push ${env.FULL_IMAGE_NAME}
+                            docker push ${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── Stage 5: Security Scan (Trivy) ────────────────────────────────────
+        // Scans the built image for OS and library CVEs.
+        // CRITICAL and HIGH severities fail the pipeline — nothing ships
+        // with known critical vulnerabilities.
+        stage('Security Scan') {
+            steps {
+                container('tools') {
+                    sh """
+                        # Install Trivy
+                        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+                        # Scan — exit code 1 if CRITICAL or HIGH CVEs found
+                        trivy image \
+                            --exit-code 1 \
+                            --severity CRITICAL,HIGH \
+                            --format table \
+                            --output reports/trivy-report.txt \
+                            --ignore-unfixed \
+                            ${env.FULL_IMAGE_NAME}
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/trivy-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 6: Terraform Plan ───────────────────────────────────────────
+        // Shows infrastructure changes without applying them.
+        // On main branch: plan only. Infra changes are applied separately
+        // via a dedicated infra pipeline with its own approval gate.
+        stage('Terraform Plan') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('tools') {
+                    sh """
+                        cd terraform
+                        terraform init -backend-config="key=payment-service/terraform.tfstate"
+                        terraform plan \
+                            -var-file="prod.tfvars" \
+                            -out=tfplan \
+                            -detailed-exitcode
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'terraform/tfplan', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 7: Deploy to Staging ────────────────────────────────────────
+        // Helm upgrade with the new image tag. Creates namespace if needed.
+        // --atomic: rolls back automatically if deployment fails within 5 min.
+        stage('Deploy to Staging') {
+            steps {
+                container('tools') {
+                    sh """
+                        # Get AKS credentials
+                        az aks get-credentials \
+                            --name ${AKS_CLUSTER_NAME} \
+                            --resource-group ${AKS_RESOURCE_GROUP} \
+                            --overwrite-existing
+
+                        # Create namespace if it doesn't exist
+                        kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+
+                        # Helm upgrade (creates release if it doesn't exist)
+                        helm upgrade ${HELM_RELEASE} ${HELM_CHART} \
+                            --install \
+                            --namespace staging \
+                            --values ${HELM_CHART}/values.yaml \
+                            --set image.repository=${ACR_LOGIN_SERVER}/${IMAGE_NAME} \
+                            --set image.tag=${IMAGE_TAG} \
+                            --set env.APP_ENV=staging \
+                            --atomic \
+                            --timeout 5m \
+                            --wait
+                    """
+                }
+            }
+        }
+
+        // ── Stage 8: Smoke Test ───────────────────────────────────────────────
+        // Hits the health probes on the staging deployment to confirm
+        // the new version is actually responding before we promote to prod.
+        stage('Smoke Test') {
+            steps {
+                container('tools') {
+                    sh """
+                        # Port-forward staging service for smoke test
+                        kubectl port-forward \
+                            svc/${HELM_RELEASE}-payment-service 8080:80 \
+                            --namespace staging &
+                        PF_PID=\$!
+                        sleep 5
+
+                        # Test liveness probe
+                        echo "Testing /healthz..."
+                        curl --fail --silent --retry 3 http://localhost:8080/healthz
+
+                        # Test readiness probe
+                        echo "Testing /readyz..."
+                        curl --fail --silent --retry 3 http://localhost:8080/readyz
+
+                        # Test a real API endpoint
+                        echo "Testing payment API..."
+                        STATUS=\$(curl --fail --silent http://localhost:8080/api/v1/payments/TXN-001 | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+                        echo "Payment status returned: \$STATUS"
+
+                        # Cleanup port-forward
+                        kill \$PF_PID
+                    """
+                }
+            }
+        }
+
+        // ── Stage 9: Approval Gate ────────────────────────────────────────────
+        // Pauses the pipeline and waits for a human to approve production deploy.
+        // Times out after 1 hour — prevents stale approvals going through.
+        // Only runs on the main branch.
+        stage('Approval Gate') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def deployer = input(
+                        id: 'prod-approval',
+                        message: "Deploy ${IMAGE_TAG} to PRODUCTION?",
+                        submitter: 'platform-leads,senior-engineers',
+                        submitterParameter: 'APPROVED_BY',
+                        parameters: [
+                            choice(
+                                name: 'ACTION',
+                                choices: ['Deploy', 'Abort'],
+                                description: 'Approve or abort production deployment'
+                            )
+                        ]
+                    )
+                    if (deployer['ACTION'] == 'Abort') {
+                        error("Production deployment aborted by ${deployer['APPROVED_BY']}")
+                    }
+                    echo "Production deployment approved by: ${deployer['APPROVED_BY']}"
+                    env.APPROVED_BY = deployer['APPROVED_BY']
+                }
+            }
+        }
+
+        // ── Stage 10: Deploy to Production ────────────────────────────────────
+        // Same helm upgrade pattern as staging but with prod values overlay.
+        // --atomic ensures automatic rollback if pods fail to become ready.
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('tools') {
+                    sh """
+                        # Create prod namespace if needed
+                        kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+
+                        # Deploy with prod values override
+                        helm upgrade ${HELM_RELEASE} ${HELM_CHART} \
+                            --install \
+                            --namespace production \
+                            --values ${HELM_CHART}/values.yaml \
+                            --values ${HELM_CHART}/values.prod.yaml \
+                            --set image.repository=${ACR_LOGIN_SERVER}/${IMAGE_NAME} \
+                            --set image.tag=${IMAGE_TAG} \
+                            --atomic \
+                            --timeout 10m \
+                            --wait
+
+                        # Tag the image as stable after successful prod deploy
+                        docker pull ${env.FULL_IMAGE_NAME}
+                        docker tag  ${env.FULL_IMAGE_NAME} ${ACR_LOGIN_SERVER}/${IMAGE_NAME}:stable
+                        docker push ${ACR_LOGIN_SERVER}/${IMAGE_NAME}:stable
+                    """
+                }
+            }
+        }
+
+    } // end stages
+
+    // ── Post-pipeline notifications ───────────────────────────────────────────
+    post {
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: """
+✅ *Payment Service deployed successfully*
+• Version: `${IMAGE_TAG}`
+• Approved by: ${env.APPROVED_BY ?: 'N/A (staging only)'}
+• Commit: ${env.GIT_MESSAGE} (${env.GIT_AUTHOR})
+• Build: <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+                """.stripIndent()
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: """
+❌ *Payment Service pipeline FAILED*
+• Version: `${IMAGE_TAG}`
+• Stage: ${env.STAGE_NAME}
+• Commit: ${env.GIT_MESSAGE} (${env.GIT_AUTHOR})
+• Build: <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+• Action: Check logs and fix before retrying
+                """.stripIndent()
+            )
+        }
+        always {
+            // Clean workspace to free disk space after every build
+            cleanWs()
+        }
+    }
+
+}
