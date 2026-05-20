@@ -41,7 +41,7 @@ az login
 az account list --output table
 
 # Set your target subscription (replace with your subscription ID)
-az account set --subscription "YOUR_SUBSCRIPTION_ID"
+az account set --subscription "b74d9869-b31c-4a6f-b855-2643b03300ac"
 
 # Confirm active subscription
 az account show --output table
@@ -52,7 +52,7 @@ az account show --output table
 # ═══════════════════════════════════════════════════════════════════════════════
 
 echo "▶ Provisioning infrastructure with Terraform..."
-cd terraform
+cd payment-service-complete/payment-service/terraform/
 
 # 2a. Create remote state storage (one-time setup — skip if already exists)
 az group create \
