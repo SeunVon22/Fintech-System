@@ -148,8 +148,8 @@ resource "azurerm_kubernetes_cluster" "main" {
 
   # ── RBAC ─────────────────────────────────────────────────────────────────
   azure_active_directory_role_based_access_control {
-    managed            = true
     azure_rbac_enabled = true
+    tenant_id          = data.azurerm_client_config.current.tenant_id
   }
 
   # ── Auto-upgrade ──────────────────────────────────────────────────────────
